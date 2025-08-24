@@ -10,6 +10,7 @@ import {
   getMealLogsByRange,
   getMealLogDateRange,
 } from "@/lib/sheets";
+import type { WebhookEvent, MessageEvent, TextEventMessage } from "@line/bot-sdk";
 
 /** ====== 必須環境変数の存在チェック ====== */
 const MUST_ENV = [
@@ -26,16 +27,18 @@ for (const k of MUST_ENV) {
   }
 }
 
-/** ====== OpenAI クライアント ====== */
+// OpenAI の ChatCompletion 型を定義
+type ChatCompletion = OpenAI.Chat.Completions.ChatCompletion;
+
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /** ====== OpenAI 呼び出し（429/5xxリトライ付き） ====== */
 async function callOpenAIWithRetry(
   messages: { role: "system" | "user" | "assistant"; content: string }[],
   { maxRetries = 2, temperature = 0.6, max_tokens = 250 }: { maxRetries?: number; temperature?: number; max_tokens?: number } = {}
-) {
+): Promise<ChatCompletion> {
   let attempt = 0;
-  let lastErr: any;
+  let lastErr: unknown;
   while (attempt <= maxRetries) {
     try {
       const resp = await client.chat.completions.create({
@@ -45,13 +48,29 @@ async function callOpenAIWithRetry(
         max_tokens,
       });
       return resp;
-    } catch (e: any) {
+    } catch (e: unknown) {
       lastErr = e;
-      const status = e?.status || e?.response?.status;
-      const isRateOrQuota = status === 429;
-      const isRetryable = isRateOrQuota || status >= 500;
 
-      console.error("[OPENAI][ERROR]", status, e?.message || e);
+      let status: number | undefined;
+      if (typeof e === "object" && e !== null) {
+        if ("status" in e && typeof (e as { status: unknown }).status === "number") {
+          status = (e as { status: number }).status;
+        } else if (
+          "response" in e &&
+          typeof (e as { response: { status?: number } }).response?.status === "number"
+        ) {
+          status = (e as { response: { status?: number } }).response.status;
+        }
+      }
+
+      const isRateOrQuota = status === 429;
+      const isRetryable = isRateOrQuota || (status !== undefined && status >= 500);
+
+      if (e instanceof Error) {
+        console.error("[OPENAI][ERROR]", status, e.message);
+      } else {
+        console.error("[OPENAI][ERROR]", status, e);
+      }
 
       if (!isRetryable || attempt === maxRetries) break;
       const delayMs = Math.min(500 * Math.pow(2, attempt), 2500);
@@ -81,8 +100,12 @@ async function replyToLine(replyToken: string, replyText: string) {
     });
     const body = await res.text().catch(() => "");
     console.log("[LINE][REPLY]", res.status, body?.slice(0, 120));
-  } catch (e: any) {
-    console.error("[LINE][REPLY][ERR]", e?.message || e);
+  } catch (e: unknown) {
+    if (e instanceof Error) {
+      console.error("[LINE][REPLY][ERR]", e.message);
+    } else {
+      console.error("[LINE][REPLY][ERR]", e);
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -94,8 +117,7 @@ function detectLogCategory(userText: string): "meal" | "exercise" | "meditation"
   if (detectMealType(userText)) return "meal";
   if (text.includes("運動") || text.includes("走") || text.includes("筋トレ") || text.includes("workout") || text.includes("run"))
     return "exercise";
-  if (text.includes("瞑想") || text.includes("meditation") || text.includes("座禅"))
-    return "meditation";
+  if (text.includes("瞑想") || text.includes("meditation") || text.includes("座禅")) return "meditation";
   if (text.includes("日記") || text.includes("ジャーナル") || text.includes("思った") || text.includes("感じた"))
     return "journal";
   return null;
@@ -134,13 +156,16 @@ function detectDateRange(userText: string): { start: string; end: string } | nul
   const today = now.toISOString().split("T")[0];
   if (userText.includes("これまで") || userText.includes("全期間")) return { start: "ALL", end: "ALL" };
   if (userText.includes("先週")) {
-    const end = new Date(now); end.setDate(now.getDate() - 1);
-    const start = new Date(end); start.setDate(end.getDate() - 6);
+    const end = new Date(now);
+    end.setDate(now.getDate() - 1);
+    const start = new Date(end);
+    start.setDate(end.getDate() - 6);
     return { start: start.toISOString().split("T")[0], end: end.toISOString().split("T")[0] };
   }
   if (userText.includes("今週")) {
     const day = now.getDay() === 0 ? 7 : now.getDay();
-    const start = new Date(now); start.setDate(now.getDate() - (day - 1));
+    const start = new Date(now);
+    start.setDate(now.getDate() - (day - 1));
     return { start: start.toISOString().split("T")[0], end: today };
   }
   if (userText.includes("今月")) {
@@ -163,17 +188,18 @@ export async function POST(req: NextRequest) {
     }
 
     const json = JSON.parse(bodyText);
-    const events = Array.isArray(json.events) ? json.events : [];
+    const events: WebhookEvent[] = Array.isArray(json.events) ? json.events : [];
 
     await Promise.all(
-      events.map(async (event: any) => {
+      events.map(async (event) => {
         try {
-          if (event.type !== "message" || event.message?.type !== "text") return;
-          
+          if (event.type !== "message" || (event as MessageEvent).message?.type !== "text") return;
+
+          const msg = (event as MessageEvent).message as TextEventMessage;
           const userId = event.source?.userId;
           console.log("[LINE][USERID]", userId);
-          
-          const userText: string = event.message.text?.trim() ?? "";
+
+          const userText: string = msg.text?.trim() ?? "";
           if (!userText) return;
 
           /** ====== ログ種別判定 ====== */
@@ -187,7 +213,10 @@ export async function POST(req: NextRequest) {
             if (start === "ALL" && end === "ALL") {
               logs = await getMealLogsByRange("ALL", "ALL");
               const actualRange = await getMealLogDateRange();
-              if (actualRange) { start = actualRange.start; end = actualRange.end; }
+              if (actualRange) {
+                start = actualRange.start;
+                end = actualRange.end;
+              }
             } else {
               logs = await getMealLogsByRange(start, end);
             }
@@ -196,7 +225,7 @@ export async function POST(req: NextRequest) {
               return;
             }
 
-            const totals = { kcal:0, protein:0, fat:0, carbs:0, vitaminB6:0, vitaminD:0, magnesium:0, iron:0, zinc:0 };
+            const totals = { kcal: 0, protein: 0, fat: 0, carbs: 0, vitaminB6: 0, vitaminD: 0, magnesium: 0, iron: 0, zinc: 0 };
             for (const row of logs) {
               totals.kcal += Number(row[5] || 0);
               totals.protein += Number(row[6] || 0);
@@ -208,9 +237,9 @@ export async function POST(req: NextRequest) {
               totals.iron += Number(row[12] || 0);
               totals.zinc += Number(row[13] || 0);
             }
-            const days = (new Date(end).getTime() - new Date(start).getTime()) / (1000*60*60*24) + 1;
+            const days = (new Date(end).getTime() - new Date(start).getTime()) / (1000 * 60 * 60 * 24) + 1;
             const fmt = (label: string, total: number, unit: string) =>
-              `${label}: ${total.toFixed(1)} ${unit}（平均 ${(total/days).toFixed(1)} ${unit}/日）`;
+              `${label}: ${total.toFixed(1)} ${unit}（平均 ${(total / days).toFixed(1)} ${unit}/日）`;
 
             const summaryText =
               `${start} 〜 ${end} のサマリー\n` +
@@ -253,21 +282,21 @@ export async function POST(req: NextRequest) {
               { maxRetries: 1, max_tokens: 250 }
             );
             const nutritionText = nutritionRes.choices?.[0]?.message?.content ?? "";
-            const kcal = nutritionText.match(/カロリー[:：]\s*([\d.]+)/)?.[1] || "";
-            const protein = nutritionText.match(/タンパク質[:：]\s*([\d.]+)/)?.[1] || "";
-            const fat = nutritionText.match(/脂質[:：]\s*([\d.]+)/)?.[1] || "";
-            const carbs = nutritionText.match(/炭水化物[:：]\s*([\d.]+)/)?.[1] || "";
-            const b6 = nutritionText.match(/ビタミンB6[:：]\s*([\d.]+)/)?.[1] || "";
-            const d = nutritionText.match(/ビタミンD[:：]\s*([\d.]+)/)?.[1] || "";
-            const mg = nutritionText.match(/マグネシウム[:：]\s*([\d.]+)/)?.[1] || "";
-            const iron = nutritionText.match(/鉄[:：]\s*([\d.]+)/)?.[1] || "";
-            const zinc = nutritionText.match(/亜鉛[:：]\s*([\d.]+)/)?.[1] || "";
+            const kcal = parseFloat(nutritionText.match(/カロリー[:：]\s*([\d.]+)/)?.[1] ?? "0");
+            const protein = parseFloat(nutritionText.match(/タンパク質[:：]\s*([\d.]+)/)?.[1] ?? "0");
+            const fat = parseFloat(nutritionText.match(/脂質[:：]\s*([\d.]+)/)?.[1] ?? "0");
+            const carbs = parseFloat(nutritionText.match(/炭水化物[:：]\s*([\d.]+)/)?.[1] ?? "0");
+            const b6 = parseFloat(nutritionText.match(/ビタミンB6[:：]\s*([\d.]+)/)?.[1] ?? "0");
+            const d = parseFloat(nutritionText.match(/ビタミンD[:：]\s*([\d.]+)/)?.[1] ?? "0");
+            const mg = parseFloat(nutritionText.match(/マグネシウム[:：]\s*([\d.]+)/)?.[1] ?? "0");
+            const iron = parseFloat(nutritionText.match(/鉄[:：]\s*([\d.]+)/)?.[1] ?? "0");
+            const zinc = parseFloat(nutritionText.match(/亜鉛[:：]\s*([\d.]+)/)?.[1] ?? "0");
 
             await appendMealLog([
               now.toISOString().split("T")[0],
               now.toTimeString().slice(0, 5),
               mealDate,
-              detectMealType(userText),
+              detectMealType(userText) ?? "",
               userText,
               kcal || 0,
               protein || 0,
@@ -322,19 +351,27 @@ export async function POST(req: NextRequest) {
               { maxRetries: 2, max_tokens: 300 }
             );
             replyText = completion.choices?.[0]?.message?.content?.slice(0, 1000) ?? replyText;
-          } catch (e: any) {
+          } catch (_e: unknown) {
             replyText = "内部エラーが発生しました。時間をおいて再試行してください。";
           }
           await replyToLine(event.replyToken, replyText);
-        } catch (inner: any) {
-          console.error("[LINE][EVENT][ERR]", inner?.message || inner);
+        } catch (inner: unknown) {
+          if (inner instanceof Error) {
+            console.error("[LINE][EVENT][ERR]", inner.message);
+          } else {
+            console.error("[LINE][EVENT][ERR]", inner);
+          }
         }
       })
     );
 
     return NextResponse.json({ status: "ok" });
-  } catch (e: any) {
-    console.error("[LINE][ERROR]", e?.message || e);
+  } catch (e: unknown) {
+    if (e instanceof Error) {
+      console.error("[LINE][ERROR]", e.message);
+    } else {
+      console.error("[LINE][ERROR]", e);
+    }
     return new NextResponse("Internal Server Error", { status: 500 });
   }
 }
